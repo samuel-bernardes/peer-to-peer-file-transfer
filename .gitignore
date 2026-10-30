@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# Arquivos gerados pelos testes
+*.bin
+*.data
+*.assembling
+*.meta.json
+dados*/
+*.log
+
+# Resultados brutos do estudo de caso (os gráficos e o CSV ficam versionados)
+results/runs/

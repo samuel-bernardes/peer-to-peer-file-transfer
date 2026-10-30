@@ -1,0 +1,5 @@
+# Mantém LF em todos os arquivos de texto, independente do sistema operacional.
+* text=auto eol=lf
+
+*.png binary
+*.pdf binary
