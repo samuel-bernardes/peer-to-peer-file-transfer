@@ -1,69 +1,107 @@
-# TP2 - Transferência de Arquivos Peer-to-Peer
+# peer-to-peer-file-transfer
 
-Implementação em Python 3.9+ utilizando apenas a biblioteca padrão (sockets TCP, threads, JSON e SHA-256).
+Trabalho Prático 2 para disciplina de Sistemas Distribuídos na graduação em
+Engenharia de Computação. O objetivo deste trabalho é implementar um sistema
+elementar de transferência de arquivos no modelo Peer-to-Peer, em que cada nó
+é ao mesmo tempo cliente e servidor, fragmenta o arquivo em blocos e os troca
+diretamente com os vizinhos.
 
-## Funcionamento
+## Ambiente
 
-- Cada peer abre um servidor TCP, atende `HAVE` (lista de blocos disponíveis) e `GET` (envio de bloco) e, ao mesmo tempo, consulta peers vizinhos para baixar blocos.
-- Metadados JSON: nome, tamanho original, tamanho de bloco, SHA-256 do arquivo e SHA-256 de cada bloco.
-- Protocolo TCP: `[4 bytes de comprimento JSON (big-endian)][JSON UTF-8][4 bytes de comprimento payload][payload]`.
-- Assim que um bloco é verificado e armazenado, outros peers podem baixá-lo. Blocos são persistidos em `diretorio/<hash>.parts/`.
-- Seleção **rarest-first** para o próximo bloco disponível. Vizinhos são estáticos via argumentos `--neighbor`.
-- Após o download, remonta, confere tamanho e SHA-256 total e continua servindo blocos até `Ctrl+C`.
+Python 3.9 ou mais novo, usando apenas a biblioteca padrão (`socket`,
+`threading`, `json`, `hashlib`). Funciona em Linux, macOS e Windows. O script de
+gráficos precisa também do `matplotlib`.
 
-## Exemplo local: 3 terminais
+No Windows, se o comando `python` abrir a Microsoft Store, use o iniciador `py`.
 
-Crie arquivo de teste e metadados:
+## Uso
+
+Primeiro gera-se o arquivo de metadados a partir do arquivo original:
 
 ```bash
 python -c "import os; open('original.bin','wb').write(os.urandom(10240))"
 python peer.py meta original.bin --block-size 1024 --output file.meta.json
 ```
 
-Terminal 1 (seeder):
+Depois cada peer roda em um terminal. Só o seeder recebe `--seed`:
 
 ```bash
-python peer.py run --port 9001 --meta file.meta.json --dir dados_seed --seed original.bin --neighbor 127.0.0.1:9002 --neighbor 127.0.0.1:9003
+# terminal 1 — seeder
+python peer.py run --port 9001 --meta file.meta.json --dir dados_1 --seed original.bin \
+    --neighbor 127.0.0.1:9002 --neighbor 127.0.0.1:9003
+
+# terminal 2 — leecher
+python peer.py run --port 9002 --meta file.meta.json --dir dados_2 \
+    --neighbor 127.0.0.1:9001 --neighbor 127.0.0.1:9003
+
+# terminal 3 — leecher
+python peer.py run --port 9003 --meta file.meta.json --dir dados_3 \
+    --neighbor 127.0.0.1:9001 --neighbor 127.0.0.1:9002
 ```
 
-Terminal 2 (leecher):
+| Argumento | Significado |
+|---|---|
+| `--port` | porta em que o peer escuta |
+| `--host` | endereço em que escuta (padrão `127.0.0.1`; use `0.0.0.0` entre máquinas) |
+| `--neighbor IP:porta` | vizinho estático, pode repetir |
+| `--meta` | arquivo de metadados |
+| `--dir` | pasta onde o peer guarda os blocos e o arquivo remontado |
+| `--seed` | arquivo completo, só no seeder inicial |
+| `--verbose` | registra cada mensagem `HAVE`, `GET` e `BLOCK` |
+
+Ao terminar, o leecher grava `dados_N/original.bin`, confere tamanho e SHA-256 e
+imprime no log quantos blocos recebeu de cada vizinho. Ele continua servindo
+blocos até `Ctrl+C`.
+
+## Funcionamento
+
+- **Metadados** (JSON): nome, tamanho, tamanho de bloco, SHA-256 do arquivo e
+  SHA-256 de cada bloco.
+- **Protocolo** (TCP): cada mensagem é
+  `[4 bytes: tamanho do cabeçalho][cabeçalho JSON][4 bytes: tamanho do payload][payload]`.
+  Há três tipos: `HAVE` (pergunta/resposta com a lista de blocos que o peer tem),
+  `GET` (pede um bloco pelo índice) e `BLOCK` (resposta com os bytes do bloco).
+- **Simetria**: uma thread aceita conexões e cria uma thread para cada conexão
+  recebida; a thread principal, enquanto isso, baixa os blocos. A conexão com cada vizinho é
+  reaproveitada para todos os pedidos.
+- **Seleção de blocos**: *rarest-first* — primeiro os blocos com menos donos
+  entre os vizinhos. O inventário (`HAVE`) é atualizado a cada 256 blocos
+  recebidos, e os pedidos são distribuídos em rodízio entre os donos de cada bloco.
+- **Tornar-se seeder**: cada bloco recebido é validado pelo hash e gravado no
+  arquivo de dados; a partir daí já é anunciado no `HAVE` e servido no `GET`.
+- **Remontagem**: os blocos ficam em um único arquivo pré-alocado
+  (`<sha256>.data`), na posição `índice × tamanho_do_bloco`. No fim ele é
+  copiado para o nome original e verificado. Se o peer for reiniciado, os blocos
+  já baixados são recuperados conferindo os hashes.
+
+## Estudo de caso
 
 ```bash
-python peer.py run --port 9002 --meta file.meta.json --dir dados_2 --neighbor 127.0.0.1:9001 --neighbor 127.0.0.1:9003
+python test_cases.py                 # teste rápido: 2 e 4 peers, bloco de 1 KB, arquivo de 10 KB
+python test_cases.py --full          # as 24 combinações da tabela do enunciado
+
+# o que foi usado no relatório: 5 repetições, CSV e logs
+python test_cases.py --full --repeats 5 --csv results/results.csv --logs results/logs
+python scripts/plot_results.py
 ```
 
-Terminal 3 (leecher):
+O script cria um arquivo aleatório, gera os metadados, sobe os peers (o `peer0`
+é o seeder e todos são vizinhos de todos), espera os downloads, compara tamanho
+e SHA-256 de cada cópia com o original e anota o tempo e a origem dos blocos de
+cada leecher.
 
-```bash
-python peer.py run --port 9003 --meta file.meta.json --dir dados_3 --neighbor 127.0.0.1:9001 --neighbor 127.0.0.1:9002
+O `plot_results.py` lê o CSV e gera `results/tempo_download.png`,
+`results/fontes_blocos.png` e a tabela `results/resumo.csv`. Os logs da primeira
+execução de cada cenário ficam em `results/logs/`.
+
+## Organização
+
+```
+peer.py                  peer: metadados, protocolo, servidor, download e remontagem
+test_cases.py            executa os cenários do enunciado e verifica integridade
+scripts/plot_results.py  gráficos e tabela-resumo do estudo de caso
+results/                 CSV, gráficos e logs da execução usada no relatório
 ```
 
-Ao final, confira `dados_2/original.bin` e `dados_3/original.bin`.
-
-## Testes automatizados
-
-```bash
-python test_cases.py          # teste rápido com 2 e 4 peers, 1 KB de bloco, arquivo de 10 KB
-python test_cases.py --full   # 24 combinações com todos os tamanhos e configurações da tabela
-```
-
-O script cria arquivos aleatórios, inicializa processos, verifica tamanho e hash de cada cópia e mostra o resultado. Use `--timeout 180` caso o computador seja lento. Para relatório com tempos, medições, logs e comparação entre fontes, estenda o script conforme desejado.
-
-## Rede entre computadores
-
-Passe `--host 0.0.0.0` para escutar em todas as interfaces e configure os `--neighbor` com os IPs reais dos demais computadores. O protocolo é didático e **não implementa autenticação nem criptografia**, portanto use apenas numa rede de testes confiável.
-
-## Windows / PowerShell
-
-Se o comando `python` abrir a Microsoft Store, use o iniciador `py`:
-
-```powershell
-py test_cases.py
-py test_cases.py --full
-```
-
-Execute os comandos na pasta que contem `test_cases.py` (confira com `dir`).
-
-### Ajuste de conexoes
-
-A versao atual reutiliza conexoes TCP com os vizinhos e atualiza o inventario de blocos a cada 64 transferencias, evitando milhares de conexoes de curta duracao e consultas repetidas de HAVE. Testes de 5 MB (2 e 4 peers, 1024 B) e 20 MB (2 peers, 4096 B) foram executados com sucesso no ambiente de desenvolvimento. Execute os testes novamente no Windows para validar nesse sistema.
+O protocolo é didático e **não tem autenticação nem criptografia**; use apenas
+em uma rede de testes confiável.
