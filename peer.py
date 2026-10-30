@@ -8,6 +8,7 @@ import socket
 import struct
 import threading
 import time
+from collections import Counter
 from pathlib import Path
 
 MAX_MESSAGE = 16 * 1024 * 1024
@@ -89,8 +90,9 @@ def load_metadata(path):
 
 
 class Peer:
-    def __init__(self, host, port, neighbors, meta, directory, seed_file=None):
+    def __init__(self, host, port, neighbors, meta, directory, seed_file=None, verbose=False):
         self.host, self.port = host, port
+        self.verbose = verbose
         self.neighbors = neighbors
         self.meta = meta
         self.directory = Path(directory)
@@ -101,6 +103,9 @@ class Peer:
         self.running = threading.Event()
         self.running.set()
         self.rr = 0
+        self._connections = {}
+        self.sources = Counter()  # blocos recebidos de cada vizinho
+        self.started = time.monotonic()
         self.seed_file = Path(seed_file) if seed_file else None
         if self.seed_file:
             if not self.seed_file.is_file() or self.seed_file.stat().st_size != meta['size'] or sha256_file(self.seed_file) != meta['sha256']:
@@ -118,6 +123,9 @@ class Peer:
             else:
                 with self.data_path.open('wb') as f:
                     f.truncate(meta['size'])
+        # Um unico descritor aberto durante toda a execucao: no Windows, abrir e fechar
+        # o arquivo a cada bloco custa varios milissegundos (verificacao do antivirus).
+        self.file = (self.seed_file or self.data_path).open('rb' if self.seed_file else 'r+b')
 
     def valid(self, index, data):
         count = len(self.meta['blocks'])
@@ -130,14 +138,8 @@ class Peer:
         with self.lock:
             if index not in self.blocks:
                 return None
-        if self.seed_file:
-            with self.seed_file.open('rb') as f:
-                f.seek(index * self.meta['block_size'])
-                data = f.read(self.meta['block_size'])
-        else:
-            with self.data_path.open('rb') as f:
-                f.seek(index * self.meta['block_size'])
-                data = f.read(self.meta['block_size'])
+            self.file.seek(index * self.meta['block_size'])
+            data = self.file.read(self.meta['block_size'])
         return data if self.valid(index, data) else None
 
     def handle(self, conn, addr):
@@ -153,6 +155,8 @@ class Peer:
                         with self.lock:
                             available = sorted(self.blocks)
                         send_message(conn, {'type': 'HAVE', 'blocks': available})
+                        if self.verbose:
+                            print(f'[{self.port}] HAVE para={addr[0]}:{addr[1]} blocos={len(available)}', flush=True)
                     elif req.get('type') == 'GET':
                         index = req.get('index')
                         data = self.get_block(index) if type(index) is int else None
@@ -160,7 +164,7 @@ class Peer:
                             send_message(conn, {'error': 'bloco indisponivel'})
                         else:
                             send_message(conn, {'type': 'BLOCK', 'index': index}, data)
-                            if index % 256 == 0 or index == len(self.meta['blocks']) - 1:
+                            if self.verbose or index % 256 == 0 or index == len(self.meta['blocks']) - 1:
                                 print(f'[{self.port}] SEND bloco={index} para={addr[0]}:{addr[1]}', flush=True)
                     else:
                         send_message(conn, {'error': 'comando invalido'})
@@ -187,8 +191,6 @@ class Peer:
 
     def request(self, neighbor, header):
         # Reutiliza uma conexao TCP por vizinho, evitando esgotar portas efemeras no Windows.
-        if not hasattr(self, '_connections'):
-            self._connections = {}
         sock = self._connections.get(neighbor)
         for attempt in range(2):
             try:
@@ -216,11 +218,11 @@ class Peer:
         with self.lock:
             if index in self.blocks:
                 return
-            with self.data_path.open('r+b') as f:
-                f.seek(index * self.meta['block_size'])
-                f.write(data)
+            self.file.seek(index * self.meta['block_size'])
+            self.file.write(data)
             self.blocks.add(index)
-            if len(self.blocks) % 256 == 0 or len(self.blocks) == len(self.meta['blocks']):
+            self.sources[f'{neighbor[0]}:{neighbor[1]}'] += 1
+            if self.verbose or len(self.blocks) % 256 == 0 or len(self.blocks) == len(self.meta['blocks']):
                 print(f'[{self.port}] RECV bloco={index} de={neighbor[0]}:{neighbor[1]} progresso={len(self.blocks)}/{len(self.meta["blocks"])}', flush=True)
 
     def download(self):
@@ -249,7 +251,8 @@ class Peer:
                             print(f'[{self.port}] Vizinho {neighbor} indisponivel: {exc}', flush=True)
                     refresh_after = progress + 256
                     cursor = 0
-                    available = sorted(candidates)
+                    # Rarest-first: blocos com menos donos primeiro, desempate pelo indice.
+                    available = sorted(candidates, key=lambda i: (len(candidates[i]), i))
                 if not candidates:
                     time.sleep(0.3)
                     continue
@@ -278,19 +281,24 @@ class Peer:
                     candidates = {}
                     time.sleep(0.1)
         finally:
-            for sock in getattr(self, '_connections', {}).values():
+            for sock in self._connections.values():
                 sock.close()
 
     def assemble(self):
         output = self.directory / self.meta['name']
         temp = self.directory / (self.meta['name'] + '.assembling')
+        with self.lock:
+            self.file.flush()
         with self.data_path.open('rb') as source, temp.open('wb') as target:
             shutil.copyfileobj(source, target, 1024 * 1024)
         if temp.stat().st_size != self.meta['size'] or sha256_file(temp) != self.meta['sha256']:
             temp.unlink(missing_ok=True)
             raise ValueError('Arquivo remontado nao passou na verificacao SHA-256')
         temp.replace(output)
-        print(f'[{self.port}] CONCLUIDO arquivo={output} tamanho={output.stat().st_size} sha256={sha256_file(output)}', flush=True)
+        elapsed = time.monotonic() - self.started
+        print(f'[{self.port}] CONCLUIDO arquivo={output} tamanho={output.stat().st_size} sha256={sha256_file(output)} tempo={elapsed:.3f}s', flush=True)
+        origins = ' '.join(f'{src}={count}' for src, count in sorted(self.sources.items()))
+        print(f'[{self.port}] FONTES {origins}', flush=True)
 
     def run(self):
         threading.Thread(target=self.serve, daemon=True).start()
@@ -320,6 +328,7 @@ def main():
     peer.add_argument('--meta', required=True)
     peer.add_argument('--dir', required=True)
     peer.add_argument('--seed', help='Caminho para arquivo original, apenas se for seeder')
+    peer.add_argument('--verbose', action='store_true', help='Registrar todas as mensagens HAVE/GET/BLOCK')
     args = parser.parse_args()
     if args.command == 'meta':
         create_metadata(args.file, args.block_size, args.output)
@@ -330,7 +339,7 @@ def main():
             if not sep or not host:
                 parser.error('Vizinho deve usar formato IP:porta')
             neighbors.append((host, int(port)))
-        Peer(args.host, args.port, neighbors, load_metadata(args.meta), args.dir, args.seed).run()
+        Peer(args.host, args.port, neighbors, load_metadata(args.meta), args.dir, args.seed, args.verbose).run()
 
 
 if __name__ == '__main__':
